@@ -10,6 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .blockwise_kernel import quantized_matmul_kernel as quantized_matmul
+from .blockwise_kernel_v2 import blockwise_kernel_pallas as quantized_matmul
 
 __all__ = ["quantized_matmul"]

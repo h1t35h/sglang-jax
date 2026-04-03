@@ -19,6 +19,8 @@ def xla_quantized_matmul_local(
     w_scale: jax.Array,
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
+    mesh: jax.sharding.Mesh | None = None,
+    axis_name: str | None = None,
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
@@ -92,6 +94,8 @@ def xla_quantized_matmul_local(
             x=x,
             w_q=w_q,
             w_scale=w_scale,
+            mesh=mesh,
+            axis_name=axis_name,
             block_size=block_size_in,
             x_q_dtype=x_q_dtype,
             tuned_value=tuned_value,
@@ -123,7 +127,10 @@ def xla_quantized_matmul_local(
 
     out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
-    if reduce_axis is not None:
+    if mesh is not None and axis_name is not None:
+        # Updated kernel handles reduction on the fly.
+        pass
+    elif reduce_axis is not None:
         out = lax.psum(out, axis_name=reduce_axis)
 
     return out

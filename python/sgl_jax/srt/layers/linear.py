@@ -336,6 +336,8 @@ class QuantizedLinear(nnx.Module):
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,
+                mesh=self.mesh,
+                axis_name=input_axis,
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
