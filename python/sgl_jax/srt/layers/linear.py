@@ -339,7 +339,7 @@ class QuantizedLinear(nnx.Module):
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
-                num_microbatches=4,
+                num_microbatches=8,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
