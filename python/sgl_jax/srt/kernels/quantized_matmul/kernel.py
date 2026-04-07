@@ -89,7 +89,10 @@ def xla_quantized_matmul_local(
             block_size_in=block_size_in,
         )
 
-    def compute_single(x_chunk):
+    def compute_chunk(carry, chunk_idx):
+        # 1. Slice along the batch dimension
+        x_chunk = jax.lax.dynamic_slice_in_dim(x, chunk_idx * chunk_size, chunk_size, axis=0)
+
         # 2. Local Matmul (Compute)
         if is_block_quant:
             out_chunk = blockwise_kernel(
@@ -129,14 +132,13 @@ def xla_quantized_matmul_local(
         if reduce_axis is not None:
             out_chunk = lax.psum(out_chunk, axis_name=reduce_axis)
 
-        return out_chunk
+        return carry, out_chunk
 
     if num_microbatches > 1:
-        x_reshaped = x.reshape(num_microbatches, chunk_size, x.shape[-1])
-        out_chunks = jax.vmap(compute_single)(x_reshaped)
-        # Flatten out_chunks
+        _, out_chunks = jax.lax.scan(compute_chunk, None, jnp.arange(num_microbatches))
+        # Flatten out_chuncks
         out = out_chunks.reshape(batch_size, -1)
     else:
-        out = compute_single(x)
+        _, out = compute_chunk(None, 0)
 
     return out
