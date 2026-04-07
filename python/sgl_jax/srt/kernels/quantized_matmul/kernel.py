@@ -135,7 +135,9 @@ def xla_quantized_matmul_local(
         return carry, out_chunk
 
     if num_microbatches > 1:
-        _, out_chunks = jax.lax.scan(compute_chunk, None, jnp.arange(num_microbatches))
+        _, out_chunks = jax.lax.scan(
+            compute_chunk, None, jnp.arange(num_microbatches), unroll=num_microbatches
+        )
         # Flatten out_chuncks
         out = out_chunks.reshape(batch_size, -1)
     else:
