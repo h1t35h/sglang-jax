@@ -55,7 +55,8 @@ def xla_quantized_matmul_local(
     is_block_quant = w_scale.ndim == 3
     batch_size = x.shape[0]
 
-    num_microbatches = jnp.where(batch_size % num_microbatches != 0, 1, num_microbatches)
+    if batch_size % num_microbatches != 0:
+        num_microbatches = 1
 
     chunk_size = batch_size // num_microbatches
 
