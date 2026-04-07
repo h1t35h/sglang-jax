@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
+from sgl_jax.srt.mem_cache import chunk_cache
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -22,6 +23,7 @@ def xla_quantized_matmul_local(
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
+    num_microbatches: int = 1,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -51,6 +53,11 @@ def xla_quantized_matmul_local(
     # (scale was expanded from [out_blocks, in_blocks] to [in_blocks, 1, n_out]
     #  at init time via expand_block_scale).
     is_block_quant = w_scale.ndim == 3
+    batch_size = x.shape[0]
+
+    num_microbatches = jnp.where(batch_size % num_microbatches != 0, 1, num_microbatches)
+
+    chunk_size = batch_size // num_microbatches
 
     if is_block_quant:
         # === Block Quantization Path ===
@@ -58,10 +65,9 @@ def xla_quantized_matmul_local(
         in_blocks = w_scale.shape[0]
         block_size_in = in_dim // in_blocks
 
-        if weight_block_size is not None:
-            block_size_out = int(weight_block_size[0])
-        else:
-            block_size_out = block_size_in
+        block_size_out = (
+            int(weight_block_size[0]) if weight_block_size is not None else block_size_in
+        )
 
         blockwise_kernel = get_blockwise_kernel()
         if blockwise_kernel is None:
@@ -69,61 +75,69 @@ def xla_quantized_matmul_local(
                 "Block-wise quantized matmul requires the blockwise kernel, "
                 "but it failed to load. Please check your installation."
             )
-        if not should_use_blockwise_kernel(
-            out_dim=int(out_dim),
-            block_size_out=int(block_size_out),
-        ):
-            raise RuntimeError(
-                f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_out} (known to cause NaNs)."
-            )
 
         # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
+
         tuned_value = get_safe_blockwise_tuned_value(
-            n_batch=int(x.shape[0]),
+            n_batch=int(chunk_size),
             n_out=int(out_dim),
             n_in=int(in_dim),
             x_q_dtype=x_q_dtype,
             w_q_dtype=w_q.dtype,
             block_size_in=block_size_in,
         )
-        out = blockwise_kernel(
-            x=x,
-            w_q=w_q,
-            w_scale=w_scale,
-            block_size=block_size_in,
-            x_q_dtype=x_q_dtype,
-            tuned_value=tuned_value,
-        )
 
-    else:
-        # === Standard Per-Channel Quantization Path ===
-        if quantize_activation:
-            x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
-            out = lax.dot_general(
-                x_q,
-                w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
-            )
-            out = (
-                out.astype(compute_dtype)
-                * x_scale.astype(compute_dtype)
-                * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+    def compute_chunk(carry, chunk_idx):
+        # 1. Slice along the batch dimension
+        x_chunk = jax.lax.dynamic_slice_in_dim(x, chunk_idx * chunk_size, chunk_size, axis=0)
+
+        # 2. Local Matmul (Compute)
+        if is_block_quant:
+            out_chunk = blockwise_kernel(
+                x=x_chunk,
+                w_q=w_q,
+                w_scale=w_scale,
+                block_size=block_size_in,
+                x_q_dtype=x_q_dtype,
+                tuned_value=tuned_value,
             )
         else:
-            out = lax.dot_general(
-                x,
-                w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
-            )
-            out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+            if quantize_activation:
+                x_q, x_scale = quantize_tensor_simple(x_chunk, act_quant_dtype, dim=-1)
+                out_chunk = lax.dot_general(
+                    x_q,
+                    w_q,
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=compute_dtype,
+                )
+                out_chunk = (
+                    out_chunk.astype(compute_dtype)
+                    * x_scale.astype(compute_dtype)
+                    * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+                )
+            else:
+                out_chunk = lax.dot_general(
+                    x_chunk,
+                    w_q,
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=compute_dtype,
+                )
+                out_chunk = out_chunk.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(
+                    compute_dtype
+                )
+        out_chunk = out_chunk.astype(out_dtype)
+        # 3. Overlap Comms
+        if reduce_axis is not None:
+            out_chunk = lax.psum(out_chunk, axis_name=reduce_axis)
 
-    out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
-    if reduce_axis is not None:
-        out = lax.psum(out, axis_name=reduce_axis)
+        return carry, out_chunk
+
+    if num_microbatches > 1:
+        _, out_chunks = jax.lax.scan(compute_chunk, None, jnp.arange(num_microbatches))
+        # Flatten out_chuncks
+        out = out_chunks.reshape(batch_size, -1)
+    else:
+        _, out = compute_chunk(None, 0)
 
     return out
