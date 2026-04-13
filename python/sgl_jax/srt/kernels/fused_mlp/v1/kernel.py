@@ -6,14 +6,11 @@ from jax.experimental.pallas import tpu as pltpu
 import functools
 
 
-def fused_quantized_mlp_kernel(
+def fused_mlp_kernel(
     x_ref,
-    wg_q_ref,
-    wg_scale_ref,
-    wu_q_ref,
-    wu_scale_ref,
-    wd_q_ref,
-    wd_scale_ref,
+    wg_ref,
+    wu_ref,
+    wd_ref,
     y_ref,  # Memory references
     *,
     seq_len: int,
@@ -45,37 +42,29 @@ def fused_quantized_mlp_kernel(
                 x_ref,
                 (pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)),
             )
-            wg_q_tile = pl.load(
-                wg_q_ref,
+            wg_tile = pl.load(
+                wg_ref,
                 (
-                    pl.dslice(inter_idx * b_inter, b_inter),
                     pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
+                    pl.dslice(inter_idx * b_inter, b_inter),
                 ),
             )
-            wg_q_tile = wg_q_tile.T
-
-            wu_q_tile = pl.load(
-                wu_q_ref,
+            wu_tile = pl.load(
+                wu_ref,
                 (
                     pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
                     pl.dslice(inter_idx * b_inter, b_inter),
                 ),
             )
 
-            h_acc_val += pl.dot(x_tile, wg_q_tile)
-            u_acc_val += pl.dot(x_tile, wu_q_tile)
+            h_acc_val += pl.dot(x_tile, wg_tile)
+            u_acc_val += pl.dot(x_tile, wu_tile)
 
             return h_acc_val, u_acc_val
 
         h_acc, u_acc = jax.lax.fori_loop(
             0, hidden_size // b_hidden_in, hidden_in_loop_body, (h_acc, u_acc)
         )
-
-        wg_scale_tile = pl.load(wg_scale_ref, (pl.dslice(inter_idx * b_inter, b_inter),))
-        wu_scale_tile = pl.load(wu_scale_ref, (pl.dslice(inter_idx * b_inter, b_inter),))
-
-        h_acc = h_acc * wg_scale_tile
-        u_acc = u_acc * wu_scale_tile
 
         # Apply activation
         a_tile = jax.nn.gelu(h_acc) * u_acc
@@ -103,17 +92,9 @@ def fused_quantized_mlp_kernel(
 
 
 @jax.jit
-def apply_fused_mlp(
-    x: jax.Array,
-    wg_q: jax.Array,
-    wg_scale: jax.Array,
-    wu_q: jax.Array,
-    wu_scale: jax.Array,
-    wd_q: jax.Array,
-    wd_scale: jax.Array,
-) -> jax.Array:
+def apply_fused_mlp(x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array) -> jax.Array:
     seq_len, hidden_size = x.shape
-    _, intermediate_size = wg_q.shape
+    _, intermediate_size = wg.shape
 
     # TODO(hitesy): verify clean division
     B_SEQ = 128
@@ -125,7 +106,7 @@ def apply_fused_mlp(
 
     return pl.pallas_call(
         functools.partial(
-            fused_quantized_mlp_kernel,
+            fused_mlp_kernel,
             seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -137,17 +118,11 @@ def apply_fused_mlp(
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
         grid=grid,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
-    )(x, wg_q, wg_scale, wu_q, wu_scale, wd_q, wd_scale)
+    )(x, wg, wu, wd)
 
 
 def apply_fused_mlp_with_padding(
-    x: jax.Array,
-    wg_q: jax.Array,
-    wg_scale: jax.Array,
-    wu_q: jax.Array,
-    wu_scale: jax.Array,
-    wd_q: jax.Array,
-    wd_scale: jax.Array,
+    x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array
 ) -> jax.Array:
     """Wraps the Pallas MLP kernel to handle arbitrary sequence lengths via padding."""
 
@@ -161,7 +136,7 @@ def apply_fused_mlp_with_padding(
     else:
         x_padded = x
 
-    out_padded = apply_fused_mlp(x_padded, wg_q, wg_scale, wu_q, wu_scale, wd_q, wd_scale)
+    out_padded = apply_fused_mlp(x_padded, wg, wu, wd)
 
     if pad_amount > 0:
         out_real = out_padded[:original_seq_len, :]

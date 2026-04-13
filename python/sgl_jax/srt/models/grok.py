@@ -222,14 +222,11 @@ class Grok1MLP(nnx.Module):
             x = jax.sharding.reshard(x, spec)
 
         # Extract underlying parameter arrays from the layer modules
-        wg_q = self.gate_proj.weight_q.value
-        wg_scale = self.gate_proj.weight_scale.value
-
-        wu_q = self.up_proj.weight_q.value
-        wu_scale = self.up_proj.weight_scale.value
-
-        wd_q = self.down_proj.weight_q.value
-        wd_scale = self.down_proj.weight_scale.value
+        # Note: Depending on your LinearBase implementation, the parameter
+        # might be named 'w', 'kernel', or 'weight'. Update as necessary.
+        wg = self.gate_proj.weight.value
+        wu = self.up_proj.weight.value
+        wd = self.down_proj.weight.value
 
         # Execute the fused kernel
         # Pallas kernels operate best on 2D inputs, so flatten batch into seq if needed.
@@ -237,7 +234,7 @@ class Grok1MLP(nnx.Module):
         if len(x.shape) == 3:
             x = x.reshape(-1, x.shape[-1])
 
-        x = apply_fused_mlp_with_padding(x, wg_q, wg_scale, wu_q, wu_scale, wd_q, wd_scale)
+        x = apply_fused_mlp_with_padding(x, wg, wu, wd)
 
         if len(original_shape) == 3:
             x = x.reshape(original_shape)
