@@ -69,10 +69,10 @@ def fused_mlp_kernel(
     # To be safe, we initialize to zero at inter_idx == 0.
     @pl.when(inter_idx == 0)
     def _init_y():
-        y_ref[pl.dslice(0, b_seq), pl.dslice(0, b_hidden)] = jnp.zeros((b_seq, b_hidden), dtype=y_ref.dtype)
+        y_ref[...] = jnp.zeros_like(y_ref[...])
 
     # Wait for initialization to complete if necessary (implied by sequential execution)
-    y_ref[pl.dslice(0, b_seq), pl.dslice(0, b_hidden)] += y_contribution.astype(y_ref.dtype)
+    y_ref[...] = (y_ref[...] + y_contribution).astype(y_ref.dtype)
 
 
 @functools.partial(jax.jit, static_argnums=(4,))
