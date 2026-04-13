@@ -22,63 +22,62 @@ def fused_mlp_kernel(
     b_inter: int,
     b_hidden_in: int,
 ):
-    seq_idx = pl.program_id(0)
-    hidden_out_idx = pl.program_id(1)
+    def seq_loop(seq_idx, _):
+        def hidden_out_loop(hidden_out_idx, _):
+            y_acc = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
 
-    y_acc = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
+            # Outer loop over the intermediate dimension
+            def inter_loop_body(inter_idx, y_acc_val):
+                # Accumulators for Gate (H) and Up (U) projections
+                h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
+                u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
 
-    # Outer loop over the intermediate dimension
-    def inter_loop_body(inter_idx, y_acc_val):
+                # Inner loop over hidden_size to compute H and U
+                def hidden_in_loop_body(hin_idx, accs):
+                    h_acc_val, u_acc_val = accs
+                    # Load from HBM to VMEM
+                    x_tile = x_ref[
+                        pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
+                    ]
+                    wg_tile = wg_ref[
+                        pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
+                        pl.dslice(inter_idx * b_inter, b_inter),
+                    ]
+                    wu_tile = wu_ref[
+                        pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
+                        pl.dslice(inter_idx * b_inter, b_inter),
+                    ]
+                    h_acc_val += pl.dot(x_tile, wg_tile)
+                    u_acc_val += pl.dot(x_tile, wu_tile)
+                    return h_acc_val, u_acc_val
 
-        # Accumulators for Gate (H) and Up (U) projections
-        h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
-        u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
+                h_acc, u_acc = jax.lax.fori_loop(
+                    0, hidden_size // b_hidden_in, hidden_in_loop_body, (h_acc, u_acc)
+                )
 
-        # Inner loop over hidden_size to compute H and U
-        def hidden_in_loop_body(hin_idx, accs):
-            h_acc_val, u_acc_val = accs
+                # Apply activation
+                a_tile = jax.nn.gelu(h_acc) * u_acc
+                a_tile = a_tile.astype(x_ref.dtype)
 
-            # Load from HBM to VMEM
-            x_tile = x_ref[
-                pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
-            ]
+                # down projection
+                wd_tile = wd_ref[
+                    pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(hidden_out_idx * b_hidden, b_hidden)
+                ]
 
-            wg_tile = wg_ref[
-                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                pl.dslice(inter_idx * b_inter, b_inter),
-            ]
+                y_acc_val += pl.dot(a_tile, wd_tile)
+                return y_acc_val
 
-            wu_tile = wu_ref[
-                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                pl.dslice(inter_idx * b_inter, b_inter),
-            ]
+            y_acc = jax.lax.fori_loop(0, intermediate_size // b_inter, inter_loop_body, y_acc)
 
-            h_acc_val += pl.dot(x_tile, wg_tile)
-            u_acc_val += pl.dot(x_tile, wu_tile)
+            y_ref[pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hidden_out_idx * b_hidden, b_hidden)] = (
+                y_acc.astype(y_ref.dtype)
+            )
+            return None
 
-            return h_acc_val, u_acc_val
+        jax.lax.fori_loop(0, hidden_size // b_hidden, hidden_out_loop, None)
+        return None
 
-        h_acc, u_acc = jax.lax.fori_loop(
-            0, hidden_size // b_hidden_in, hidden_in_loop_body, (h_acc, u_acc)
-        )
-
-        # Apply activation
-        a_tile = jax.nn.gelu(h_acc) * u_acc
-        a_tile = a_tile.astype(x_ref.dtype)
-
-        # down projection
-        wd_tile = wd_ref[
-            pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(hidden_out_idx * b_hidden, b_hidden)
-        ]
-
-        y_acc_val += pl.dot(a_tile, wd_tile)
-        return y_acc_val
-
-    y_acc = jax.lax.fori_loop(0, intermediate_size // b_inter, inter_loop_body, y_acc)
-
-    y_ref[pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hidden_out_idx * b_hidden, b_hidden)] = (
-        y_acc.astype(y_ref.dtype)
-    )
+    jax.lax.fori_loop(0, seq_len // b_seq, seq_loop, None)
 
 
 @functools.partial(jax.jit, static_argnums=(4,))
@@ -115,7 +114,8 @@ def apply_fused_mlp_sharded(
         B_INTER = 128  # Make sure local_inter_size is cleanly divisible by this!
         B_HIDDEN_IN = 128
 
-        grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
+        # We force sequential execution by using a 1x1 grid and looping inside the kernel.
+        grid = (1, 1)
 
         # Execute Pallas on purely local data
         y_loc = pl.pallas_call(
