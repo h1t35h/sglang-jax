@@ -46,10 +46,10 @@ def fused_mlp_kernel(
     def hidden_in_loop_body(hin_idx, accs):
         h_acc_val, u_acc_val = accs
         
-        # Slice values using standard Python slicing (supported on values)
-        x_tile = x_val[:, hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in]
-        wg_tile = wg_val[hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in, :]
-        wu_tile = wu_val[hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in, :]
+        # Slice values using dynamic_slice_in_dim since hin_idx is traced
+        x_tile = jax.lax.dynamic_slice_in_dim(x_val, hin_idx * b_hidden_in, b_hidden_in, axis=1)
+        wg_tile = jax.lax.dynamic_slice_in_dim(wg_val, hin_idx * b_hidden_in, b_hidden_in, axis=0)
+        wu_tile = jax.lax.dynamic_slice_in_dim(wu_val, hin_idx * b_hidden_in, b_hidden_in, axis=0)
         
         h_acc_val += pl.dot(x_tile, wg_tile)
         u_acc_val += pl.dot(x_tile, wu_tile)
