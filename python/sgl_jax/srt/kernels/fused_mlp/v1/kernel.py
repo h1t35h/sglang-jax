@@ -87,13 +87,13 @@ def apply_fused_mlp_sharded(
 
     # 1. Define the sharding layout for the inputs based on QuantizedLinear
     # x is fully replicated (unsharded)
-    # Gate/Up weights are column-parallel, so the intermediate dimension (axis 0) is sharded
-    # Down weights are row-parallel, so the intermediate dimension (axis 1) is sharded
+    # Gate/Up weights are column-parallel, so the intermediate dimension (axis 1) is sharded
+    # Down weights are row-parallel, so the intermediate dimension (axis 0) is sharded
     in_specs = (
         P(None, None),  # x
-        P("tensor", None),  # wg_q
-        P("tensor", None),  # wu_q
-        P(None, "tensor"),  # wd_q
+        P(None, "tensor"),  # wg_q
+        P(None, "tensor"),  # wu_q
+        P("tensor", None),  # wd_q
     )
 
     # The output of the local matmul will be replicated
@@ -107,7 +107,7 @@ def apply_fused_mlp_sharded(
         seq_len, hidden_size = x_loc.shape
 
         # CRITICAL: We now use the LOCAL intermediate size (e.g., 32768 / 8 devices = 4096)
-        local_inter_size, _ = wg_loc.shape
+        _, local_inter_size = wg_loc.shape
 
         B_SEQ = 128
         B_HIDDEN = 128
