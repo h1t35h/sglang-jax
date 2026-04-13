@@ -13,6 +13,9 @@ def fused_mlp_kernel(
     wu_ref,
     wd_ref,
     y_ref,  # Memory references
+    wg_scratch,
+    wu_scratch,
+    sem,
     *,
     seq_len: int,
     hidden_size: int,
@@ -37,19 +40,31 @@ def fused_mlp_kernel(
         def hidden_in_loop_body(hin_idx, accs):
             h_acc_val, u_acc_val = accs
             # Load from HBM to VMEM
+            # x_ref is sliced by B_SEQ in in_specs, so shape is (b_seq, hidden_size)
             x_tile = x_ref[
-                pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
+                pl.dslice(0, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
             ]
-            wg_tile = wg_ref[
-                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                pl.dslice(inter_idx * b_inter, b_inter),
-            ]
-            wu_tile = wu_ref[
-                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                pl.dslice(inter_idx * b_inter, b_inter),
-            ]
-            h_acc_val += pl.dot(x_tile, wg_tile)
-            u_acc_val += pl.dot(x_tile, wu_tile)
+            
+            # Async copy wg and wu tiles to scratchpad
+            c1 = pltpu.make_async_copy(
+                wg_ref.at[pl.ds(hin_idx * b_hidden_in, b_hidden_in), pl.ds(inter_idx * b_inter, b_inter)],
+                wg_scratch.at[pl.ds(0, b_hidden_in), pl.ds(0, b_inter)],
+                sem.at[0],
+            )
+            c1.start()
+            
+            c2 = pltpu.make_async_copy(
+                wu_ref.at[pl.ds(hin_idx * b_hidden_in, b_hidden_in), pl.ds(inter_idx * b_inter, b_inter)],
+                wu_scratch.at[pl.ds(0, b_hidden_in), pl.ds(0, b_inter)],
+                sem.at[0],
+            )
+            c2.start()
+            
+            c1.wait()
+            c2.wait()
+            
+            h_acc_val += pl.dot(x_tile, wg_scratch)
+            u_acc_val += pl.dot(x_tile, wu_scratch)
             return h_acc_val, u_acc_val
 
         h_acc, u_acc = jax.lax.fori_loop(
@@ -61,8 +76,9 @@ def fused_mlp_kernel(
         a_tile = a_tile.astype(x_ref.dtype)
 
         # down projection
+        # wd_ref is sliced by B_HIDDEN in in_specs along dim 1
         wd_tile = wd_ref[
-            pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(hidden_out_idx * b_hidden, b_hidden)
+            pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(0, b_hidden)
         ]
 
         y_acc_val += pl.dot(a_tile, wd_tile)
@@ -70,7 +86,8 @@ def fused_mlp_kernel(
 
     y_acc = jax.lax.fori_loop(0, intermediate_size // b_inter, inter_loop_body, y_acc)
 
-    y_ref[pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hidden_out_idx * b_hidden, b_hidden)] = (
+    # y_ref is sliced by B_SEQ and B_HIDDEN in out_specs
+    y_ref[pl.dslice(0, b_seq), pl.dslice(0, b_hidden)] = (
         y_acc.astype(y_ref.dtype)
     )
 
@@ -132,9 +149,17 @@ def apply_fused_mlp_sharded(
                 b_hidden_in=B_HIDDEN_IN,
             ),
             out_shape=jax.ShapeDtypeStruct(x_loc.shape, x_loc.dtype),
-            grid=grid,
-            in_specs=in_specs,
-            out_specs=out_specs,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                grid=grid,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=[
+                    pltpu.VMEM((B_HIDDEN_IN, B_INTER), wg.dtype),
+                    pltpu.VMEM((B_HIDDEN_IN, B_INTER), wu.dtype),
+                    pltpu.SemaphoreType.DMA((1,)),
+                ],
+            ),
             compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary")),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
