@@ -110,9 +110,9 @@ def apply_fused_mlp_sharded(
         # CRITICAL: We now use the LOCAL intermediate size (e.g., 32768 / 8 devices = 4096)
         _, local_inter_size = wg_loc.shape
 
-        B_SEQ = 128
-        B_HIDDEN = 128
-        B_INTER = 128  # Make sure local_inter_size is cleanly divisible by this!
+        B_SEQ = 64
+        B_HIDDEN = 64
+        B_INTER = 64  # Make sure local_inter_size is cleanly divisible by this!
         B_HIDDEN_IN = 128
 
         grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
