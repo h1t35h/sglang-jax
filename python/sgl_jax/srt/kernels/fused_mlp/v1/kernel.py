@@ -32,6 +32,12 @@ def fused_mlp_kernel(
     def _init_y():
         y_scratch[...] = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
 
+    # Read whole blocks into values to avoid pl.dslice in loops
+    x_val = x_ref[...]
+    wg_val = wg_ref[...]
+    wu_val = wu_ref[...]
+    wd_val = wd_ref[...]
+
     # Accumulators for Gate (H) and Up (U) projections
     h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
     u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
@@ -39,20 +45,14 @@ def fused_mlp_kernel(
     # Inner loop over hidden_size to compute H and U
     def hidden_in_loop_body(hin_idx, accs):
         h_acc_val, u_acc_val = accs
-        # x_ref is sliced by B_SEQ in in_specs, so shape is (b_seq, hidden_size)
-        x_tile = x_ref[
-            pl.dslice(0, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
-        ]
-        # wg_ref is sliced by B_INTER in in_specs, so shape is (hidden_size, b_inter)
-        wg_tile = wg_ref[
-            pl.dslice(hin_idx * b_hidden_in, b_hidden_in), pl.dslice(0, b_inter)
-        ]
-        wu_tile = wu_ref[
-            pl.dslice(hin_idx * b_hidden_in, b_hidden_in), pl.dslice(0, b_inter)
-        ]
         
-        h_acc_val += pl.dot(x_tile[...], wg_tile[...])
-        u_acc_val += pl.dot(x_tile[...], wu_tile[...])
+        # Slice values using standard Python slicing (supported on values)
+        x_tile = x_val[:, hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in]
+        wg_tile = wg_val[hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in, :]
+        wu_tile = wu_val[hin_idx * b_hidden_in : (hin_idx + 1) * b_hidden_in, :]
+        
+        h_acc_val += pl.dot(x_tile, wg_tile)
+        u_acc_val += pl.dot(x_tile, wu_tile)
         return h_acc_val, u_acc_val
 
     h_acc, u_acc = jax.lax.fori_loop(
@@ -64,10 +64,8 @@ def fused_mlp_kernel(
     a_tile = a_tile.astype(x_ref.dtype)
 
     # down projection
-    # wd_ref is sliced by B_INTER and B_HIDDEN in in_specs, so shape is (b_inter, b_hidden)
-    wd_tile = wd_ref[pl.dslice(0, b_inter), pl.dslice(0, b_hidden)]
-
-    y_contribution = pl.dot(a_tile, wd_tile[...])
+    # wd_val is already read and has shape (b_inter, b_hidden)
+    y_contribution = pl.dot(a_tile, wd_val)
 
     # Read current accumulator value
     acc = y_scratch[...]
