@@ -390,9 +390,14 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            w0_scale = self.wi_0_scale.value if self.wi_0_scale is not None else None
-            w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
-            wo_scale = self.wo_scale.value if self.wo_scale is not None else None
+            # Reshard weights to match intended sharding if they are different
+            wi_0_reshard = jax.sharding.reshard(self.wi_0.value, P("expert", None, "tensor"))
+            wi_1_reshard = jax.sharding.reshard(self.wi_1.value, P("expert", None, "tensor"))
+            wo_reshard = jax.sharding.reshard(self.wo.value, P("expert", "tensor", None))
+
+            w0_scale = jax.sharding.reshard(self.wi_0_scale.value, P("expert", None, None, "tensor")) if self.wi_0_scale is not None else None
+            w1_scale = jax.sharding.reshard(self.wi_1_scale.value, P("expert", None, None, "tensor")) if self.wi_1_scale is not None else None
+            wo_scale = jax.sharding.reshard(self.wo_scale.value, P("expert", None, None, None)) if self.wo_scale is not None else None
 
             if len(hidden_states_reshard.shape) == 2 and hidden_states_reshard.shape[0] >= 64 or len(hidden_states_reshard.shape) == 3 and hidden_states_reshard.shape[1] >= 64:
                 out_specs = P("tensor", None) if len(hidden_states_reshard.shape) == 2 else P(None, "tensor", None)
@@ -424,9 +429,9 @@ class EPMoE(nnx.Module):
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
-                self.wi_0.value,
-                self.wi_1.value,
-                self.wo.value,
+                wi_0_reshard,
+                wi_1_reshard,
+                wo_reshard,
                 w0_scale,
                 w1_scale,
                 wo_scale,
