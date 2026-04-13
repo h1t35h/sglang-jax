@@ -112,12 +112,12 @@ def apply_fused_mlp_sharded(
         grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
 
         in_specs = (
-            pl.BlockSpec(lambda seq_idx, hidden_idx: (seq_idx * B_SEQ, 0), (B_SEQ, hidden_size)),
-            pl.BlockSpec(lambda seq_idx, hidden_idx: (0, 0), (hidden_size, local_inter_size)),
-            pl.BlockSpec(lambda seq_idx, hidden_idx: (0, 0), (hidden_size, local_inter_size)),
-            pl.BlockSpec(lambda seq_idx, hidden_idx: (0, hidden_idx * B_HIDDEN), (local_inter_size, B_HIDDEN)),
+            pl.BlockSpec((B_SEQ, hidden_size), lambda seq_idx, hidden_idx: (seq_idx * B_SEQ, 0)),
+            pl.BlockSpec((hidden_size, local_inter_size), lambda seq_idx, hidden_idx: (0, 0)),
+            pl.BlockSpec((hidden_size, local_inter_size), lambda seq_idx, hidden_idx: (0, 0)),
+            pl.BlockSpec((local_inter_size, B_HIDDEN), lambda seq_idx, hidden_idx: (0, hidden_idx * B_HIDDEN)),
         )
-        out_specs = pl.BlockSpec(lambda seq_idx, hidden_idx: (seq_idx * B_SEQ, hidden_idx * B_HIDDEN), (B_SEQ, B_HIDDEN))
+        out_specs = pl.BlockSpec((B_SEQ, B_HIDDEN), lambda seq_idx, hidden_idx: (seq_idx * B_SEQ, hidden_idx * B_HIDDEN))
 
         # Execute Pallas on purely local data
         y_loc = pl.pallas_call(
