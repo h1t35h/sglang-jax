@@ -1,3 +1,4 @@
+from sgl_jax.srt.kernels.fused_mlp.v1.kernel import apply_fused_mlp_with_padding
 import logging
 from collections.abc import Callable
 from typing import Any, cast
@@ -211,26 +212,39 @@ class Grok1MLP(nnx.Module):
             kernel_axes=("tensor", None),
             mesh=mesh,
         )
-        self.act_fn = GeluAndMul(approximate="tanh")
-        self.layer_id = layer_id
-        self.reduce_results = reduce_results
         self.mesh = mesh
 
     @log_shardings("MLP")
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Unshard activations if sequence parallel enabled
+        # Unshard activations (Sequence Parallelism setup)
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
             spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
             x = jax.sharding.reshard(x, spec)
 
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
-        x, _ = self.act_fn(gate, up)
-        x, _ = self.down_proj(x)
+        # Extract underlying parameter arrays from the layer modules
+        # Note: Depending on your LinearBase implementation, the parameter
+        # might be named 'w', 'kernel', or 'weight'. Update as necessary.
+        wg = self.gate_proj.weight
+        wu = self.up_proj.weight
+        wd = self.down_proj.weight
+
+        # Execute the fused kernel
+        # Pallas kernels operate best on 2D inputs, so flatten batch into seq if needed.
+        original_shape = x.shape
+        if len(x.shape) == 3:
+            x = x.reshape(-1, x.shape[-1])
+
+        x = apply_fused_mlp_with_padding(x, wg, wu, wd)
+
+        if len(original_shape) == 3:
+            x = x.reshape(original_shape)
+
+        # Reshard for Reduce-Scatter / All-Reduce (Sequence Parallelism teardown)
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
             if len(x.shape) == 2 and x.shape[0] >= 64 or len(x.shape) == 3 and x.shape[1] >= 64:
                 out_specs = jax.sharding.PartitionSpec("tensor", None) if len(x.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
                 x = jax.sharding.reshard(x, out_specs)
+
         return x
 
 
