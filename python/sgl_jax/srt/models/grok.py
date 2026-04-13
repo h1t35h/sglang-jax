@@ -224,9 +224,9 @@ class Grok1MLP(nnx.Module):
         # Extract underlying parameter arrays from the layer modules
         # Note: Depending on your LinearBase implementation, the parameter
         # might be named 'w', 'kernel', or 'weight'. Update as necessary.
-        wg = self.gate_proj.weight
-        wu = self.up_proj.weight
-        wd = self.down_proj.weight
+        wg = self.gate_proj.weight.value
+        wu = self.up_proj.weight.value
+        wd = self.down_proj.weight.value
 
         # Execute the fused kernel
         # Pallas kernels operate best on 2D inputs, so flatten batch into seq if needed.
