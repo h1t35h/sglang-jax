@@ -131,7 +131,7 @@ def apply_fused_mlp_sharded(
             ),
             out_shape=jax.ShapeDtypeStruct(x_loc.shape, x_loc.dtype),
             grid=grid,
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("sequential", "sequential")),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary")),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
         # 3. All-Reduce: Sum the partial results across the TP devices
