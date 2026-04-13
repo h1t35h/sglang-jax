@@ -13,6 +13,7 @@ def fused_mlp_kernel(
     wu_ref,
     wd_ref,
     y_ref,  # Memory references
+    y_scratch, # Scratchpad for accumulation
     *,
     seq_len: int,
     hidden_size: int,
@@ -26,6 +27,11 @@ def fused_mlp_kernel(
     hidden_out_idx = pl.program_id(1)
     inter_idx = pl.program_id(2)
 
+    # Initialize scratchpad to zero at the beginning of reduction
+    @pl.when(inter_idx == 0)
+    def _init_y():
+        y_scratch[...] = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
+
     # Accumulators for Gate (H) and Up (U) projections
     h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
     u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
@@ -33,7 +39,6 @@ def fused_mlp_kernel(
     # Inner loop over hidden_size to compute H and U
     def hidden_in_loop_body(hin_idx, accs):
         h_acc_val, u_acc_val = accs
-        # Load from HBM to VMEM
         # x_ref is sliced by B_SEQ in in_specs, so shape is (b_seq, hidden_size)
         x_tile = x_ref[
             pl.dslice(0, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
@@ -64,15 +69,19 @@ def fused_mlp_kernel(
 
     y_contribution = pl.dot(a_tile, wd_tile[...])
 
-    # Accumulate into y_ref across inter_idx
-    # We assume arbitrary dimension semantics will serialize this if there is a hazard.
-    # To be safe, we initialize to zero at inter_idx == 0.
-    @pl.when(inter_idx == 0)
-    def _init_y():
-        y_ref[...] = jnp.zeros_like(y_ref[...])
+    # Read current accumulator value
+    acc = y_scratch[...]
+    acc = acc + y_contribution
 
-    # Wait for initialization to complete if necessary (implied by sequential execution)
-    y_ref[...] = (y_ref[...] + y_contribution).astype(y_ref.dtype)
+    is_last = inter_idx == (intermediate_size // b_inter - 1)
+
+    @pl.when(is_last)
+    def _write():
+        y_ref[...] = acc.astype(y_ref.dtype)
+
+    @pl.when(~is_last)
+    def _save():
+        y_scratch[...] = acc
 
 
 @functools.partial(jax.jit, static_argnums=(4,))
@@ -129,6 +138,7 @@ def apply_fused_mlp_sharded(
                 grid=grid,
                 in_specs=in_specs,
                 out_specs=out_specs,
+                scratch_shapes=[pltpu.VMEM((B_SEQ, B_HIDDEN), jnp.float32)],
             ),
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("parallel", "parallel", "arbitrary")
