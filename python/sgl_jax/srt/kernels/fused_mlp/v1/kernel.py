@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 import functools
@@ -130,7 +131,7 @@ def apply_fused_mlp_sharded(
             ),
             out_shape=jax.ShapeDtypeStruct(x_loc.shape, x_loc.dtype),
             grid=grid,
-            compiler_params=dict(mosaic=dict(dimension_semantics=("parallel", "parallel"))),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
         # 3. All-Reduce: Sum the partial results across the TP devices
