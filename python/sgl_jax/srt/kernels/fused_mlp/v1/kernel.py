@@ -42,22 +42,19 @@ def fused_mlp_kernel(
     h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
     u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
 
-    # Inner loop over hidden_size to compute H and U
-    def hidden_in_loop_body(hin_idx, accs):
-        h_acc_val, u_acc_val = accs
+    # Use a Python for loop to unroll the loop.
+    # This makes hin_idx a static integer, allowing standard Python slicing!
+    num_in_blocks = hidden_size // b_hidden_in
+    for hin_idx in range(num_in_blocks):
+        start = hin_idx * b_hidden_in
+        end = (hin_idx + 1) * b_hidden_in
         
-        # Slice values using dynamic_slice_in_dim since hin_idx is traced
-        x_tile = jax.lax.dynamic_slice_in_dim(x_val, hin_idx * b_hidden_in, b_hidden_in, axis=1)
-        wg_tile = jax.lax.dynamic_slice_in_dim(wg_val, hin_idx * b_hidden_in, b_hidden_in, axis=0)
-        wu_tile = jax.lax.dynamic_slice_in_dim(wu_val, hin_idx * b_hidden_in, b_hidden_in, axis=0)
+        x_tile = x_val[:, start:end]
+        wg_tile = wg_val[start:end, :]
+        wu_tile = wu_val[start:end, :]
         
-        h_acc_val += pl.dot(x_tile, wg_tile)
-        u_acc_val += pl.dot(x_tile, wu_tile)
-        return h_acc_val, u_acc_val
-
-    h_acc, u_acc = jax.lax.fori_loop(
-        0, hidden_size // b_hidden_in, hidden_in_loop_body, (h_acc, u_acc)
-    )
+        h_acc += pl.dot(x_tile, wg_tile)
+        u_acc += pl.dot(x_tile, wu_tile)
 
     # Apply activation
     a_tile = jax.nn.gelu(h_acc) * u_acc
