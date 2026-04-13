@@ -63,8 +63,8 @@ def fused_mlp_kernel(
             c1.wait()
             c2.wait()
             
-            h_acc_val += pl.dot(x_tile, wg_scratch)
-            u_acc_val += pl.dot(x_tile, wu_scratch)
+            h_acc_val += pl.dot(x_tile[...], wg_scratch[...])
+            u_acc_val += pl.dot(x_tile[...], wu_scratch[...])
             return h_acc_val, u_acc_val
 
         h_acc, u_acc = jax.lax.fori_loop(
@@ -81,7 +81,7 @@ def fused_mlp_kernel(
             pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(0, b_hidden)
         ]
 
-        y_acc_val += pl.dot(a_tile, wd_tile)
+        y_acc_val += pl.dot(a_tile, wd_tile[...])
         return y_acc_val
 
     y_acc = jax.lax.fori_loop(0, intermediate_size // b_inter, inter_loop_body, y_acc)
