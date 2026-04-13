@@ -38,24 +38,19 @@ def fused_mlp_kernel(
             h_acc_val, u_acc_val = accs
 
             # Load from HBM to VMEM
-            x_tile = pl.load(
-                x_ref,
-                (pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)),
-            )
-            wg_tile = pl.load(
-                wg_ref,
-                (
-                    pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                    pl.dslice(inter_idx * b_inter, b_inter),
-                ),
-            )
-            wu_tile = pl.load(
-                wu_ref,
-                (
-                    pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
-                    pl.dslice(inter_idx * b_inter, b_inter),
-                ),
-            )
+            x_tile = x_ref[
+                pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hin_idx * b_hidden_in, b_hidden_in)
+            ]
+
+            wg_tile = wg_ref[
+                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
+                pl.dslice(inter_idx * b_inter, b_inter),
+            ]
+
+            wu_tile = wu_ref[
+                pl.dslice(hin_idx * b_hidden_in, b_hidden_in),
+                pl.dslice(inter_idx * b_inter, b_inter),
+            ]
 
             h_acc_val += pl.dot(x_tile, wg_tile)
             u_acc_val += pl.dot(x_tile, wu_tile)
@@ -71,23 +66,17 @@ def fused_mlp_kernel(
         a_tile = a_tile.astype(x_ref.dtype)
 
         # down projection
-        wd_tile = pl.load(
-            wd_ref,
-            (
-                pl.dslice(inter_idx * b_inter, b_inter),
-                pl.dslice(hidden_out_idx * b_hidden, b_hidden),
-            ),
-        )
+        wd_tile = wd_ref[
+            pl.dslice(inter_idx * b_inter, b_inter), pl.dslice(hidden_out_idx * b_hidden, b_hidden)
+        ]
 
         y_acc_val += pl.dot(a_tile, wd_tile)
         return y_acc_val
 
     y_acc = jax.lax.fori_loop(0, intermediate_size // b_inter, inter_loop_body, y_acc)
 
-    pl.store(
-        y_ref,
-        (pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hidden_out_idx * b_hidden, b_hidden)),
-        y_acc.astype(y_ref.dtype),
+    y_ref[pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(hidden_out_idx * b_hidden, b_hidden)] = (
+        y_acc.astype(y_ref.dtype)
     )
 
 
