@@ -113,7 +113,7 @@ def apply_fused_mlp_sharded(
         B_SEQ = 128
         B_HIDDEN = 128
         B_INTER = 128  # Make sure local_inter_size is cleanly divisible by this!
-        B_HIDDEN_IN = 64
+        B_HIDDEN_IN = 128
 
         grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
 
