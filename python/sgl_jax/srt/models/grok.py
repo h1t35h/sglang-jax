@@ -234,7 +234,7 @@ class Grok1MLP(nnx.Module):
         if len(x.shape) == 3:
             x = x.reshape(-1, x.shape[-1])
 
-        x = apply_fused_mlp_with_padding(x, wg, wu, wd)
+        x = apply_fused_mlp_with_padding(x, wg, wu, wd, self.mesh)
 
         if len(original_shape) == 3:
             x = x.reshape(original_shape)

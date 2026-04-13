@@ -1,8 +1,8 @@
-from flax.nnx import Intermediate
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
 import functools
 
 
@@ -80,38 +80,73 @@ def fused_mlp_kernel(
     )
 
 
-@jax.jit
-def apply_fused_mlp(x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array) -> jax.Array:
-    seq_len, hidden_size = x.shape
-    _, intermediate_size = wg.shape
+@functools.partial(jax.jit, static_argnums=(4,))
+def apply_fused_mlp_sharded(
+    x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array, mesh: jax.sharding.Mesh
+) -> jax.Array:
 
-    # TODO(hitesy): verify clean division
-    B_SEQ = 128
-    B_HIDDEN = 128
-    B_INTER = 256
-    B_HIDDEN_IN = 128
+    # 1. Define the sharding layout for the inputs based on QuantizedLinear
+    # x is fully replicated (unsharded)
+    # Gate/Up weights are column-parallel, so the intermediate dimension (axis 0) is sharded
+    # Down weights are row-parallel, so the intermediate dimension (axis 1) is sharded
+    in_specs = (
+        P(None, None),  # x
+        P("tensor", None),  # wg_q
+        P("tensor", None),  # wu_q
+        P(None, "tensor"),  # wd_q
+    )
 
-    grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
+    # The output of the local matmul will be replicated
+    out_specs = P(None, None)
 
-    return pl.pallas_call(
-        functools.partial(
-            fused_mlp_kernel,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            b_seq=B_SEQ,
-            b_hidden=B_HIDDEN,
-            b_inter=B_INTER,
-            b_hidden_in=B_HIDDEN_IN,
-        ),
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        grid=grid,
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
-    )(x, wg, wu, wd)
+    # 2. Wrap the Pallas execution in a shard_map
+    @functools.partial(
+        shard_map, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+    )
+    def local_fused_mlp(x_loc, wg_loc, wu_loc, wd_loc):
+        seq_len, hidden_size = x_loc.shape
+
+        # CRITICAL: We now use the LOCAL intermediate size (e.g., 32768 / 8 devices = 4096)
+        local_inter_size, _ = wg_loc.shape
+
+        B_SEQ = 128
+        B_HIDDEN = 128
+        B_INTER = 256  # Make sure local_inter_size is cleanly divisible by this!
+        B_HIDDEN_IN = 128
+
+        grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN)
+
+        # Execute Pallas on purely local data
+        y_loc = pl.pallas_call(
+            functools.partial(
+                fused_mlp_kernel,
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                intermediate_size=local_inter_size,  # Pass local size to the kernel loop
+                b_seq=B_SEQ,
+                b_hidden=B_HIDDEN,
+                b_inter=B_INTER,
+                b_hidden_in=B_HIDDEN_IN,
+            ),
+            out_shape=jax.ShapeDtypeStruct(x_loc.shape, x_loc.dtype),
+            grid=grid,
+            compiler_params=dict(mosaic=dict(dimension_semantics=("parallel", "parallel"))),
+        )(x_loc, wg_loc, wu_loc, wd_loc)
+
+        # 3. All-Reduce: Sum the partial results across the TP devices
+        y_global = jax.lax.psum(y_loc, axis_name="tensor")
+        return y_global
+
+    # Execute the mapped function
+    return local_fused_mlp(x, wg, wu, wd)
 
 
 def apply_fused_mlp_with_padding(
-    x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array
+    x: jax.Array,
+    wg: jax.Array,
+    wu: jax.Array,
+    wd: jax.Array,
+    mesh: jax.sharding.Mesh,
 ) -> jax.Array:
     """Wraps the Pallas MLP kernel to handle arbitrary sequence lengths via padding."""
 
@@ -125,7 +160,8 @@ def apply_fused_mlp_with_padding(
     else:
         x_padded = x
 
-    out_padded = apply_fused_mlp(x_padded, wg, wu, wd)
+    # Pass the mesh down into the sharded execution
+    out_padded = apply_fused_mlp_sharded(x_padded, wg, wu, wd, mesh)
 
     if pad_amount > 0:
         out_real = out_padded[:original_seq_len, :]
