@@ -136,7 +136,7 @@ def apply_fused_mlp_sharded(
                 scratch_shapes=[pltpu.VMEM((B_SEQ, B_HIDDEN), jnp.float32)],
             ),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("parallel", "parallel", "arbitrary")
+                dimension_semantics=("parallel", "arbitrary", "arbitrary")
             ),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
