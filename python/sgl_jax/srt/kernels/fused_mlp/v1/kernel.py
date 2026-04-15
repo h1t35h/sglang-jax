@@ -13,7 +13,7 @@ def fused_mlp_kernel(
     wu_ref,
     wd_ref,
     y_ref,  # Memory references
-    y_scratch, # Scratchpad for accumulation
+    y_scratch,  # Scratchpad for accumulation
     *,
     seq_len: int,
     hidden_size: int,
@@ -27,46 +27,23 @@ def fused_mlp_kernel(
     hidden_out_idx = pl.program_id(1)
     inter_idx = pl.program_id(2)
 
-    # Initialize scratchpad to zero at the beginning of reduction
     @pl.when(inter_idx == 0)
-    def _init_y():
+    def _():
         y_scratch[...] = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
 
-    # Read whole blocks into values to avoid pl.dslice in loops
-    x_val = x_ref[...]
-    wg_val = wg_ref[...]
-    wu_val = wu_ref[...]
-    wd_val = wd_ref[...]
-
-    # Accumulators for Gate (H) and Up (U) projections
-    h_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
-    u_acc = jnp.zeros((b_seq, b_inter), dtype=jnp.float32)
-
-    # Use a Python for loop to unroll the loop.
-    # This makes hin_idx a static integer, allowing standard Python slicing!
-    num_in_blocks = hidden_size // b_hidden_in
-    for hin_idx in range(num_in_blocks):
-        start = hin_idx * b_hidden_in
-        end = (hin_idx + 1) * b_hidden_in
-        
-        x_tile = x_val[:, start:end]
-        wg_tile = wg_val[start:end, :]
-        wu_tile = wu_val[start:end, :]
-        
-        h_acc += pl.dot(x_tile, wg_tile)
-        u_acc += pl.dot(x_tile, wu_tile)
+    h_sram = x_ref[...] @ wg_ref[...]
+    u_sram = x_ref[...] @ wu_ref[...]
 
     # Apply activation
-    a_tile = jax.nn.gelu(h_acc) * u_acc
+    a_tile = jax.nn.gelu(h_sram) * u_sram
     a_tile = a_tile.astype(x_ref.dtype)
 
     # down projection
-    # wd_val is already read and has shape (b_inter, b_hidden)
-    y_contribution = pl.dot(a_tile, wd_val)
+    y_current_sram = a_tile @ wd_ref[...]
 
     # Read current accumulator value
     acc = y_scratch[...]
-    acc = acc + y_contribution
+    acc = acc + y_current_sram
 
     is_last = inter_idx == (intermediate_size // b_inter - 1)
 
@@ -102,18 +79,18 @@ def apply_fused_mlp_sharded(
 
         B_SEQ = 128
         B_HIDDEN = 128
-        B_INTER = 128  
+        B_INTER = 128
         B_HIDDEN_IN = 128
 
         grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN, local_inter_size // B_INTER)
 
         in_specs = (
-            pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, h_i, i_i: (s_i * B_SEQ, 0)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i * B_INTER)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i * B_INTER)),
-            pl.BlockSpec((B_INTER, B_HIDDEN), lambda s_i, h_i, i_i: (i_i * B_INTER, h_i * B_HIDDEN)),
+            pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, h_i, i_i: (s_i, 0)),
+            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i)),
+            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i)),
+            pl.BlockSpec((B_INTER, B_HIDDEN), lambda s_i, h_i, i_i: (i_i, h_i)),
         )
-        out_specs = pl.BlockSpec((B_SEQ, B_HIDDEN), lambda s_i, h_i, i_i: (s_i * B_SEQ, h_i * B_HIDDEN))
+        out_specs = pl.BlockSpec((B_SEQ, B_HIDDEN), lambda s_i, h_i, i_i: (s_i, h_i))
 
         # Execute Pallas on purely local data
         y_loc = pl.pallas_call(
@@ -154,7 +131,7 @@ def apply_fused_mlp_with_padding(
     rem = seq_len % B_SEQ
     if rem == 0:
         return apply_fused_mlp_sharded(x, wg, wu, wd, mesh)
-    
+
     pad_len = B_SEQ - rem
     x_padded = jnp.pad(x, ((0, pad_len), (0, 0)), mode="constant")
     out_padded = apply_fused_mlp_sharded(x_padded, wg, wu, wd, mesh)
