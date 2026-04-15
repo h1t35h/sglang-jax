@@ -98,18 +98,18 @@ def apply_fused_mlp_sharded(
             pl.BlockSpec(
                 (B_SEQ, hidden_size),
                 lambda s_i, i_i: (s_i, 0),
-                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+                pipeline_mode=pl.Buffered(buffer_count=2),
             ),
             # Fetch 2 * B_INTER because it contains both wg and wu blocks
             pl.BlockSpec(
                 (hidden_size, 2 * B_INTER),
                 lambda s_i, i_i: (0, i_i),
-                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+                pipeline_mode=pl.Buffered(buffer_count=2),
             ),
             pl.BlockSpec(
                 (B_INTER, hidden_size),
                 lambda s_i, i_i: (i_i, 0),
-                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+                pipeline_mode=pl.Buffered(buffer_count=2),
             ),
         )
 
