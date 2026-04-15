@@ -95,10 +95,22 @@ def apply_fused_mlp_sharded(
         grid = (seq_len // B_SEQ, local_inter_size // B_INTER)
 
         pallas_in_specs = (
-            pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0)),
+            pl.BlockSpec(
+                (B_SEQ, hidden_size),
+                lambda s_i, i_i: (s_i, 0),
+                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+            ),
             # Fetch 2 * B_INTER because it contains both wg and wu blocks
-            pl.BlockSpec((hidden_size, 2 * B_INTER), lambda s_i, i_i: (0, i_i)),
-            pl.BlockSpec((B_INTER, hidden_size), lambda s_i, i_i: (i_i, 0)),
+            pl.BlockSpec(
+                (hidden_size, 2 * B_INTER),
+                lambda s_i, i_i: (0, i_i),
+                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+            ),
+            pl.BlockSpec(
+                (B_INTER, hidden_size),
+                lambda s_i, i_i: (i_i, 0),
+                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
+            ),
         )
 
         pallas_out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
@@ -113,7 +125,7 @@ def apply_fused_mlp_sharded(
             ),
             out_shape=jax.ShapeDtypeStruct((seq_len, hidden_size), x_loc.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=2,
+                num_scalar_prefetch=0,
                 grid=grid,
                 in_specs=pallas_in_specs,
                 out_specs=pallas_out_specs,
