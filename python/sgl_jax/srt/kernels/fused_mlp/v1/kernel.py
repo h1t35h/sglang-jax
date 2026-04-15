@@ -12,41 +12,40 @@ def fused_mlp_kernel(
     wg_ref,
     wu_ref,
     wd_ref,
-    y_ref,  # Memory references
-    y_scratch,  # Scratchpad for accumulation
+    y_ref,
+    y_scratch,
     *,
-    seq_len: int,
+    b_seq: int,
+    b_inter: int,
     hidden_size: int,
     intermediate_size: int,
-    b_seq: int,
-    b_hidden: int,
-    b_inter: int,
-    b_hidden_in: int,
 ):
-    seq_idx = pl.program_id(0)
-    hidden_out_idx = pl.program_id(1)
-    inter_idx = pl.program_id(2)
+    s_i = pl.program_id(0)
+    i_i = pl.program_id(1)
 
-    @pl.when(inter_idx == 0)
-    def _():
-        y_scratch[...] = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
+    # Initialize accumulator scratchpad on the first intermediate block
+    @pl.when(i_i == 0)
+    def _init():
+        y_scratch[...] = jnp.zeros((b_seq, hidden_size), dtype=jnp.float32)
 
+    # 1. Compute Up-Projection (Done exactly ONCE per s_i and i_i)
+    # Contraction over hidden_size
     h_sram = jnp.matmul(x_ref[...], wg_ref[...], preferred_element_type=jnp.float32)
     u_sram = jnp.matmul(x_ref[...], wu_ref[...], preferred_element_type=jnp.float32)
 
-    # Apply activation
+    # Apply activation -> Shape: [B_SEQ, B_INTER]
     a_tile = jax.nn.gelu(h_sram) * u_sram
     a_tile = a_tile.astype(x_ref.dtype)
 
-    # down projection
-    # Replace line 42:
+    # 2. Compute Down-Projection
+    # Contraction over B_INTER
     y_current_sram = jnp.matmul(a_tile, wd_ref[...], preferred_element_type=jnp.float32)
 
-    # Read current accumulator value
+    # 3. Accumulate
     acc = y_scratch[...]
     acc = acc + y_current_sram
 
-    is_last = inter_idx == (intermediate_size // b_inter - 1)
+    is_last = i_i == (intermediate_size // b_inter - 1)
 
     @pl.when(is_last)
     def _write():
@@ -61,6 +60,10 @@ def fused_mlp_kernel(
 def apply_fused_mlp_sharded(
     x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array, mesh: jax.sharding.Mesh
 ) -> jax.Array:
+
+    wg = wg.astype(jnp.bfloat16)
+    wu = wu.astype(jnp.bfloat16)
+    wd = wd.astype(jnp.bfloat16)
 
     in_specs = (
         P(None, None),  # x
@@ -79,31 +82,27 @@ def apply_fused_mlp_sharded(
         _, local_inter_size = wg_loc.shape
 
         B_SEQ = 128
-        B_HIDDEN = 128
         B_INTER = 128
-        B_HIDDEN_IN = 128
 
-        grid = (seq_len // B_SEQ, hidden_size // B_HIDDEN, local_inter_size // B_INTER)
+        # CRITICAL FIX: 2D Grid. We drop h_i to prevent redundant up-projection math.
+        grid = (seq_len // B_SEQ, local_inter_size // B_INTER)
 
         in_specs = (
-            pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, h_i, i_i: (s_i, 0)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, h_i, i_i: (0, i_i)),
-            pl.BlockSpec((B_INTER, B_HIDDEN), lambda s_i, h_i, i_i: (i_i, h_i)),
+            pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0)),
+            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, i_i: (0, i_i)),
+            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, i_i: (0, i_i)),
+            pl.BlockSpec((B_INTER, hidden_size), lambda s_i, i_i: (i_i, 0)),
         )
-        out_specs = pl.BlockSpec((B_SEQ, B_HIDDEN), lambda s_i, h_i, i_i: (s_i, h_i))
 
-        # Execute Pallas on purely local data
+        out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
+
         y_loc = pl.pallas_call(
             functools.partial(
                 fused_mlp_kernel,
-                seq_len=seq_len,
+                b_seq=B_SEQ,
+                b_inter=B_INTER,
                 hidden_size=hidden_size,
                 intermediate_size=local_inter_size,
-                b_seq=B_SEQ,
-                b_hidden=B_HIDDEN,
-                b_inter=B_INTER,
-                b_hidden_in=B_HIDDEN_IN,
             ),
             out_shape=jax.ShapeDtypeStruct((seq_len, hidden_size), x_loc.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -111,10 +110,12 @@ def apply_fused_mlp_sharded(
                 grid=grid,
                 in_specs=in_specs,
                 out_specs=out_specs,
-                scratch_shapes=[pltpu.VMEM((B_SEQ, B_HIDDEN), jnp.float32)],
+                # Scratchpad spans the full hidden dimension for accumulation
+                scratch_shapes=[pltpu.VMEM((B_SEQ, hidden_size), jnp.float32)],
             ),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("parallel", "parallel", "arbitrary")
+                # i_i is "arbitrary" to force sequential accumulation on the same core
+                dimension_semantics=("parallel", "arbitrary")
             ),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
