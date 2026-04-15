@@ -66,8 +66,9 @@ def apply_fused_mlp_sharded(
 
     in_specs = (
         P(None, None),  # x
-        P(None, "tensor"),  # wg_q
-        P("tensor", None),  # wd_q
+        P(None, "tensor"),  # wg
+        P(None, "tensor"),  # wu
+        P("tensor", None),  # wd
     )
 
     out_specs = P(None, None)
@@ -93,12 +94,12 @@ def apply_fused_mlp_sharded(
 
         grid = (seq_len // B_SEQ, local_inter_size // B_INTER)
 
-        pallas_in_specs = [
+        pallas_in_specs = (
             pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0)),
             # Fetch 2 * B_INTER because it contains both wg and wu blocks
             pl.BlockSpec((hidden_size, 2 * B_INTER), lambda s_i, i_i: (0, i_i)),
             pl.BlockSpec((B_INTER, hidden_size), lambda s_i, i_i: (i_i, 0)),
-        ]
+        )
 
         pallas_out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
 
@@ -119,9 +120,7 @@ def apply_fused_mlp_sharded(
                 scratch_shapes=[pltpu.VMEM((B_SEQ, hidden_size), jnp.float32)],
             ),
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary")),
-        )(
-            x_loc, w_gu_loc, wd_loc
-        )  # Note: we pass 3 inputs instead of 4 now
+        )(x_loc, w_gu_loc, wd_loc)
 
         return jax.lax.psum(y_loc, axis_name="tensor")
 
