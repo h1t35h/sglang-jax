@@ -9,8 +9,7 @@ import functools
 
 def fused_mlp_kernel(
     x_ref,
-    wg_ref,
-    wu_ref,
+    w_gu_ref,  # Combined wg and wu reference
     wd_ref,
     y_ref,
     y_scratch,
@@ -28,17 +27,16 @@ def fused_mlp_kernel(
     def _init():
         y_scratch[...] = jnp.zeros((b_seq, hidden_size), dtype=jnp.float32)
 
-    # 1. Compute Up-Projection (Done exactly ONCE per s_i and i_i)
-    # Contraction over hidden_size
-    h_sram = jnp.matmul(x_ref[...], wg_ref[...], preferred_element_type=jnp.float32)
-    u_sram = jnp.matmul(x_ref[...], wu_ref[...], preferred_element_type=jnp.float32)
+    hu_sram = jnp.matmul(x_ref[...], w_gu_ref[...], preferred_element_type=jnp.float32)
 
-    # Apply activation -> Shape: [B_SEQ, B_INTER]
+    # Split the result in SRAM (zero-cost operation)
+    h_sram = hu_sram[:, :b_inter]
+    u_sram = hu_sram[:, b_inter:]
+
+    # Apply activation -> Shape: [b_seq, b_inter]
     a_tile = jax.nn.gelu(h_sram) * u_sram
     a_tile = a_tile.astype(x_ref.dtype)
 
-    # 2. Compute Down-Projection
-    # Contraction over B_INTER
     y_current_sram = jnp.matmul(a_tile, wd_ref[...], preferred_element_type=jnp.float32)
 
     # 3. Accumulate
@@ -61,6 +59,7 @@ def apply_fused_mlp_sharded(
     x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array, mesh: jax.sharding.Mesh
 ) -> jax.Array:
 
+    # Cast weights to bfloat16 to half HBM bandwidth overhead
     wg = wg.astype(jnp.bfloat16)
     wu = wu.astype(jnp.bfloat16)
     wd = wd.astype(jnp.bfloat16)
@@ -81,20 +80,28 @@ def apply_fused_mlp_sharded(
         seq_len, hidden_size = x_loc.shape
         _, local_inter_size = wg_loc.shape
 
-        B_SEQ = 128
-        B_INTER = 128
+        B_SEQ = 64
+        B_INTER = 256
 
-        # CRITICAL FIX: 2D Grid. We drop h_i to prevent redundant up-projection math.
+        # Interleave wg and wu block-by-block so the kernel fetches them correctly
+        num_blocks = local_inter_size // B_INTER
+        wg_reshaped = wg_loc.reshape(hidden_size, num_blocks, B_INTER)
+        wu_reshaped = wu_loc.reshape(hidden_size, num_blocks, B_INTER)
+
+        # Concat along the block dimension, then flatten back out
+        w_gu_loc = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
+        w_gu_loc = w_gu_loc.reshape(hidden_size, local_inter_size * 2)
+
         grid = (seq_len // B_SEQ, local_inter_size // B_INTER)
 
-        in_specs = (
+        pallas_in_specs = (
             pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, i_i: (0, i_i)),
-            pl.BlockSpec((hidden_size, B_INTER), lambda s_i, i_i: (0, i_i)),
+            # Fetch 2 * B_INTER because it contains both wg and wu blocks
+            pl.BlockSpec((hidden_size, 2 * B_INTER), lambda s_i, i_i: (0, i_i)),
             pl.BlockSpec((B_INTER, hidden_size), lambda s_i, i_i: (i_i, 0)),
         )
 
-        out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
+        pallas_out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
 
         y_loc = pl.pallas_call(
             functools.partial(
@@ -106,18 +113,16 @@ def apply_fused_mlp_sharded(
             ),
             out_shape=jax.ShapeDtypeStruct((seq_len, hidden_size), x_loc.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=0,
+                num_scalar_prefetch=2,
                 grid=grid,
-                in_specs=in_specs,
-                out_specs=out_specs,
-                # Scratchpad spans the full hidden dimension for accumulation
+                in_specs=pallas_in_specs,
+                out_specs=pallas_out_specs,
                 scratch_shapes=[pltpu.VMEM((B_SEQ, hidden_size), jnp.float32)],
             ),
-            compiler_params=pltpu.CompilerParams(
-                # i_i is "arbitrary" to force sequential accumulation on the same core
-                dimension_semantics=("parallel", "arbitrary")
-            ),
-        )(x_loc, wg_loc, wu_loc, wd_loc)
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary")),
+        )(
+            x_loc, w_gu_loc, wd_loc
+        )  # Note: we pass 3 inputs instead of 4 now
 
         return jax.lax.psum(y_loc, axis_name="tensor")
 
