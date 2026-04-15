@@ -214,6 +214,27 @@ class Grok1MLP(nnx.Module):
         )
         self.mesh = mesh
 
+    def _get_weight(self, proj) -> jax.Array:
+        """Dynamically extract weights, dequantizing if necessary."""
+        # Check if the projection layer is quantized
+        if hasattr(proj, "weight_q"):
+            w_q = proj.weight_q.value
+            scale = proj.weight_scale.value
+
+            # Ensure scale is broadcastable [output_size, 1]
+            if scale.ndim == 1:
+                scale = scale[:, None]
+
+            # Dequantize and cast to the original compute dtype
+            dtype = proj.compute_dtype if proj.compute_dtype else proj.params_dtype
+            w_dequantized = w_q.astype(dtype) * scale
+
+            # Transpose back to [input_size, output_size] to match LinearBase
+            return w_dequantized.T
+
+        # Fallback for standard LinearBase
+        return proj.weight.value
+
     @log_shardings("MLP")
     def __call__(self, x: jax.Array) -> jax.Array:
         # Unshard activations (Sequence Parallelism setup)
@@ -221,12 +242,9 @@ class Grok1MLP(nnx.Module):
             spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
             x = jax.sharding.reshard(x, spec)
 
-        # Extract underlying parameter arrays from the layer modules
-        # Note: Depending on your LinearBase implementation, the parameter
-        # might be named 'w', 'kernel', or 'weight'. Update as necessary.
-        wg = self.gate_proj.weight.value
-        wu = self.up_proj.weight.value
-        wd = self.down_proj.weight.value
+        wg = self._get_weight(self.gate_proj)
+        wu = self._get_weight(self.up_proj)
+        wd = self._get_weight(self.down_proj)
 
         # Execute the fused kernel
         # Pallas kernels operate best on 2D inputs, so flatten batch into seq if needed.
