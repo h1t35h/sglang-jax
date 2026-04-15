@@ -118,7 +118,7 @@ def apply_fused_mlp_sharded(
             ),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
-        return y_loc
+        return jax.lax.psum(y_loc, axis_name="tensor")
 
     return local_fused_mlp(x, wg, wu, wd)
 
