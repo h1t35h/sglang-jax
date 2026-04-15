@@ -94,12 +94,12 @@ def apply_fused_mlp_sharded(
 
         grid = (seq_len // B_SEQ, local_inter_size // B_INTER)
 
-        pallas_in_specs = (
+        pallas_in_specs = [
             pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0)),
             # Fetch 2 * B_INTER because it contains both wg and wu blocks
             pl.BlockSpec((hidden_size, 2 * B_INTER), lambda s_i, i_i: (0, i_i)),
             pl.BlockSpec((B_INTER, hidden_size), lambda s_i, i_i: (i_i, 0)),
-        )
+        ]
 
         pallas_out_specs = pl.BlockSpec((B_SEQ, hidden_size), lambda s_i, i_i: (s_i, 0))
 
