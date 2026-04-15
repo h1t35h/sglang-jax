@@ -67,7 +67,6 @@ def apply_fused_mlp_sharded(
     in_specs = (
         P(None, None),  # x
         P(None, "tensor"),  # wg_q
-        P(None, "tensor"),  # wu_q
         P("tensor", None),  # wd_q
     )
 
