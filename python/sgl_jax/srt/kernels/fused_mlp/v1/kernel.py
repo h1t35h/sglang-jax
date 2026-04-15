@@ -31,15 +31,16 @@ def fused_mlp_kernel(
     def _():
         y_scratch[...] = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
 
-    h_sram = x_ref[...] @ wg_ref[...]
-    u_sram = x_ref[...] @ wu_ref[...]
+    h_sram = jnp.matmul(x_ref[...], wg_ref[...], preferred_element_type=jnp.float32)
+    u_sram = jnp.matmul(x_ref[...], wu_ref[...], preferred_element_type=jnp.float32)
 
     # Apply activation
     a_tile = jax.nn.gelu(h_sram) * u_sram
     a_tile = a_tile.astype(x_ref.dtype)
 
     # down projection
-    y_current_sram = a_tile @ wd_ref[...]
+    # Replace line 42:
+    y_current_sram = jnp.matmul(a_tile, wd_ref[...], preferred_element_type=jnp.float32)
 
     # Read current accumulator value
     acc = y_scratch[...]
