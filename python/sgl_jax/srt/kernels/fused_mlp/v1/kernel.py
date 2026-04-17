@@ -27,7 +27,9 @@ def fused_mlp_kernel(
     def _init():
         y_scratch[...] = jnp.zeros((b_seq, hidden_size), dtype=jnp.float32)
 
-    hu_sram = jnp.matmul(x_ref[...], w_gu_ref[...], preferred_element_type=jnp.float32)
+    w_gu_sram = w_gu_ref[...]
+    w_gu_sram = w_gu_sram.astype(x_ref.dtype)
+    hu_sram = jnp.matmul(x_ref[...], w_gu_sram, preferred_element_type=jnp.float32)
 
     # Split the result in SRAM (zero-cost operation)
     h_sram = hu_sram[:, :b_inter]
@@ -37,7 +39,9 @@ def fused_mlp_kernel(
     a_tile = jax.nn.gelu(h_sram) * u_sram
     a_tile = a_tile.astype(x_ref.dtype)
 
-    y_current_sram = jnp.matmul(a_tile, wd_ref[...], preferred_element_type=jnp.float32)
+    wd_sram = wd_ref[...]
+    wd_sram = wd_sram.astype(x_ref.dtype)
+    y_current_sram = jnp.matmul(a_tile, wd_sram, preferred_element_type=jnp.float32)
 
     # 3. Accumulate
     acc = y_scratch[...]
@@ -59,10 +63,7 @@ def apply_fused_mlp_sharded(
     x: jax.Array, wg: jax.Array, wu: jax.Array, wd: jax.Array, mesh: jax.sharding.Mesh
 ) -> jax.Array:
 
-    # Cast weights to bfloat16 to half HBM bandwidth overhead
-    wg = wg.astype(jnp.bfloat16)
-    wu = wu.astype(jnp.bfloat16)
-    wd = wd.astype(jnp.bfloat16)
+    # Weights are kept in their original dtype (e.g., float8_e4m3fn) to save HBM bandwidth
 
     in_specs = (
         P(None, None),  # x
