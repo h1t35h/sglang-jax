@@ -218,19 +218,26 @@ class Grok1MLP(nnx.Module):
 
     @log_shardings("MLP")
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Unshard activations if sequence parallel enabled
+        # Check if already sequence parallel, if not make it sequence parallel
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
-            x = jax.sharding.reshard(x, spec)
+            sp_spec = (
+                jax.sharding.PartitionSpec("tensor", None)
+                if len(x.shape) == 2
+                else jax.sharding.PartitionSpec(None, "tensor", None)
+            )
+            target_sharding = jax.sharding.NamedSharding(self.mesh, sp_spec)
+            if x.sharding != target_sharding:
+                x = jax.sharding.reshard(x, sp_spec)
 
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
         x, _ = self.down_proj(x)
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            if len(x.shape) == 2 and x.shape[0] >= 64 or len(x.shape) == 3 and x.shape[1] >= 64:
-                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(x.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
-                x = jax.sharding.reshard(x, out_specs)
+            if len(x.shape) == 2 and x.shape[0] >= 64:
+                x = jax.sharding.reshard(x, jax.sharding.PartitionSpec("tensor", None))
+            elif len(x.shape) == 3 and x.shape[1] >= 64:
+                x = jax.sharding.reshard(x, jax.sharding.PartitionSpec(None, "tensor", None))
         return x
 
 
@@ -275,7 +282,7 @@ class Grok1MoE(nnx.Module):
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
 
         # Select MoE backend based on config
-        self.moe_backend = getattr(config, "moe_backend", "epmoe")
+        self.moe_backend = getattr(config, "moe_backend", "fused")
         self.use_fused = self.moe_backend == "fused"
 
         if self.use_fused:
@@ -314,10 +321,14 @@ class Grok1MoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
-        # Unshard activations if sequence parallel enabled
+        # Ensure sequence parallel if sequence length is large enough
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
-            hidden_states = jax.sharding.reshard(hidden_states, spec)
+            sp_spec = (
+                jax.sharding.PartitionSpec("tensor", None)
+                if len(hidden_states.shape) == 2
+                else jax.sharding.PartitionSpec(None, "tensor", None)
+            )
+            hidden_states = jax.sharding.reshard(hidden_states, sp_spec)
 
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
@@ -545,9 +556,12 @@ class Grok1Attention(nnx.Module):
         output, _ = self.o_proj(attn_output)
 
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
-                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(output.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
-                output = jax.sharding.reshard(output, out_specs)
+            if len(output.shape) == 2 and output.shape[0] >= 64:
+                output = jax.sharding.reshard(output, jax.sharding.PartitionSpec("tensor", None))
+            elif len(output.shape) == 3 and output.shape[1] >= 64:
+                output = jax.sharding.reshard(
+                    output, jax.sharding.PartitionSpec(None, "tensor", None)
+                )
 
         return output, kv_fused
 

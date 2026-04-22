@@ -241,7 +241,7 @@ class QuantizedLinear(nnx.Module):
         if x_2d.shape[0] >= 64:
             out_specs = P(input_axis, output_axis)
         else:
-            out_specs = P(None, output_axis)
+            out_specs = P(input_axis, output_axis)
 
         output = shard_map(
             partial(
@@ -259,11 +259,8 @@ class QuantizedLinear(nnx.Module):
         # row parallel
         if input_axis:
             with use_abstract_mesh(self.mesh.abstract_mesh):
-            # Sequence parallel
-                if output.shape[0] >= 64:
-                    output = jax.sharding.reshard(output, P(input_axis, None))
-                else:
-                    output = jax.sharding.reshard(output, P(None, None))
+                # Enforce Sequence parallel
+                output = jax.sharding.reshard(output, P(input_axis, None))
 
         # Reshape back to original batch dimensions
         if x.ndim > 2:

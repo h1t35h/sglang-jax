@@ -69,6 +69,6 @@ def xla_quantized_matmul_local(
         if out.shape[0] >= 64:
             out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
         else:
-            out = lax.psum(out, reduce_axis)
+            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
 
     return out

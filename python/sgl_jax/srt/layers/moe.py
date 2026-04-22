@@ -1049,7 +1049,16 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
+        if (
+            len(output.shape) == 2
+            and output.shape[0] >= 64
+            or len(output.shape) == 3
+            and output.shape[1] >= 64
+        ):
+            out_specs = P("tensor", None) if len(output.shape) == 2 else P(None, "tensor", None)
+        else:
+            out_specs = P(None, None)
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, out_specs))
         return output
 
 
