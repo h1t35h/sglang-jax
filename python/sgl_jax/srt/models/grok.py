@@ -225,9 +225,7 @@ class Grok1MLP(nnx.Module):
                 if len(x.shape) == 2
                 else jax.sharding.PartitionSpec(None, "tensor", None)
             )
-            target_sharding = jax.sharding.NamedSharding(self.mesh, sp_spec)
-            if x.sharding != target_sharding:
-                x = jax.sharding.reshard(x, sp_spec)
+            x = jax.sharding.reshard(x, sp_spec)
 
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
